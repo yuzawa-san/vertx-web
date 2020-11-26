@@ -22,7 +22,11 @@ import io.vertx.codegen.annotations.VertxGen;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.json.EncodeException;
+import io.vertx.core.json.Json;
 import io.vertx.ext.web.handler.impl.HttpStatusException;
 
 import java.util.List;
@@ -275,25 +279,82 @@ public interface Route {
    * for example, {@link RoutingContext#end()} has been called, then nothing shall happen. For the remaining cases, the
    * response of the future is then passed to the method {@link RoutingContext#json(Object)} to perform a
    * JSON serialization of the result.
-   *
+   * <p>
+   * {@code null} responses are also allowed. In this case, the status code will be set to 204 (success with no content)
+   * and an empty body. This also means that the content type will not be set.
+   * <p>
    * Internally the function is wrapped as a handler that handles error cases for the user too. For example, if the
    * function throws an exception the error will be catched and a proper error will be propagated throw the router.
-   *
+   * <p>
    * Also if the same happens while encoding the response, errors are catched and propagated to the router.
    *
-   * @param <T> a generic type to allow type safe API
+   * @param <T>      a generic type to allow type safe API
    * @param function the request handler function
    * @return a reference to this, so the API can be used fluently
    */
   @Fluent
-  default <T> Route respond(Function<RoutingContext, Future<T>> function) {
+  default <T> Route respond(Function<RoutingContext, Future<@Nullable T>> function) {
     return handler(ctx -> {
       try {
         function.apply(ctx)
           .onFailure(ctx::fail)
           .onSuccess(body -> {
             if (!ctx.response().headWritten()) {
-              ctx.json(body);
+              if (body == null) {
+                ctx.response()
+                  .setStatusCode(204)
+                  .end();
+              } else {
+                ctx.json(body);
+              }
+            } else {
+              if (body == null) {
+                if (!ctx.response().ended()) {
+                  ctx.end();
+                }
+              } else {
+                ctx.fail(new HttpStatusException(500, "Response already written"));
+              }
+            }
+          });
+      } catch (RuntimeException e) {
+        ctx.fail(e);
+      }
+    });
+  }
+
+  default <T> Route respondWith(ResponseType<T> responseType, Function<RoutingContext, Future<@Nullable T>> function) {
+    if (responseType == null) {
+      throw new IllegalArgumentException("'responseType' cannot be null");
+    }
+    if (function == null) {
+      throw new IllegalArgumentException("'function' cannot be null");
+    }
+
+    return handler(ctx -> {
+      try {
+        function.apply(ctx)
+          .onFailure(ctx::fail)
+          .onSuccess(body -> {
+            if (!ctx.response().headWritten()) {
+              if (body == null) {
+                ctx.response()
+                  .setStatusCode(204)
+                  .end();
+              } else {
+                Buffer buffer;
+                try {
+                  buffer = responseType.encode(body);
+                } catch (EncodeException | UnsupportedOperationException e) {
+                  // handle the failure
+                  ctx.fail(e);
+                  return;
+                }
+                // apply the content type header only if the encoding succeeds
+                ctx.response()
+                  .putHeader(HttpHeaders.CONTENT_TYPE, responseType.contentType())
+                  .end(buffer);
+              }
             } else {
               if (body == null) {
                 if (!ctx.response().ended()) {
